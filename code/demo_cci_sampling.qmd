@@ -1,0 +1,225 @@
+---
+title: "CCI Sequential Sampling — Demo"
+author: "Your Name"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    theme: cosmo
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+set.seed(4321)
+```
+
+## Overview
+
+This demo shows how to:
+
+1.  **Plan a sample size** N for CCI testing using the **posterior predictive** criterion (PPD) with your **decision-boundary priors**:
+    -   **Exponential**: λ \~ Gamma(α,β) with β chosen so that Eθ\[Pr(X\>T\|λ)\] = ε.
+    -   **GPD (µ=0)**: ξ \~ HalfNormal(νξ), σ \~ HalfNormal(νσ) where νσ is solved so that Eθ\[Pr(X\>T\|ξ,σ)\]=ε.
+2.  **Analyze current data** (left-censored at C or observed) and decide **PASS/FAIL** using the **PPD** rule:\
+    E\[Pr(Ẋ \> T \| θ)\|data\] \< ε.
+
+------------------------------------------------------------------------
+
+## Load functions & packages
+
+```{r}
+#| label: load-pkgs
+# Core helpers for planning & analysis (place this file next to the qmd)
+source("cci_sampling.R")
+
+# Tables/plots
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(scales)
+```
+
+------------------------------------------------------------------------
+
+## Constants used in this demo
+
+```{r}
+#| label: constants
+C <- 1e-7              # censoring point
+L <- 10^(-6.5)          # planning pseudo-censor
+T_fail <- 1e-6          # failure threshold
+epsilon <- 3e-6         # acceptable defect proportion
+
+alpha_exp <- 2       # exponential prior shape
+nu_xi <- 0.04            # GPD half-normal sd for xi
+```
+
+------------------------------------------------------------------------
+
+# 1) Sample size planning
+
+### 1.1 Exponential planning
+
+```{r}
+plan_exp <- cci_exp_sample_size(C, L, T_fail, epsilon, alpha_exp,N_start = 5)
+plan_exp
+```
+
+### 1.2 GPD planning
+
+```{r}
+plan_gpd <- cci_gpd_sample_size(C, L, T_fail, epsilon, nu_xi)
+plan_gpd
+```
+
+### 1.3 Sensitivity to L
+
+```{r}
+Ls <- c(10^-6.4, 10^-6.6, 10^-6.8, 10^-7)
+sens_rows <- lapply(Ls, function(Ltest) {
+  pe <- try(
+    cci_exp_sample_size(
+      C, Ltest, T_fail, epsilon, alpha_exp,
+      N_start = 5, N_step =5, N_max = 200,
+      iter = 8000, burn = 3000, prop_sd = 1000
+    ),
+    silent = TRUE
+  )
+  pg <- try(
+    cci_gpd_sample_size(
+      C, Ltest, T_fail, epsilon, nu_xi,
+      N_start = 5, N_step = 5, N_max = 200,
+      iter = 12000, burn = 6000, prior_nsim = 15000
+    ),
+    silent = TRUE
+  )
+
+  data.frame(
+    L = Ltest,
+    model = c("Exponential", "GPD"),
+    N = c(if (inherits(pe, "try-error")) NA_integer_ else pe$N,
+          if (inherits(pg, "try-error")) NA_integer_ else pg$N),
+    PPD = c(if (inherits(pe, "try-error")) NA_real_ else pe$ppd,
+            if (inherits(pg, "try-error")) NA_real_ else pg$ppd),
+    err = c(if (inherits(pe, "try-error")) as.character(pe) else NA_character_,
+            if (inherits(pg, "try-error")) as.character(pg) else NA_character_)
+  )
+})
+sens_df <- do.call(rbind, sens_rows)
+
+sens_df %>%
+  dplyr::mutate(L = scales::scientific(L)) %>%
+  knitr::kable(caption = "Sample size N vs L (with PPD and any errors)")
+
+```
+
+```{r}
+ggplot(sens_df, aes(x=L, y=N, color=model, group=model)) +
+  geom_point(size=2) + geom_line() +
+  scale_y_continuous(labels=comma) +
+  labs(title="Required N vs Planning L", x="L (scientific)", y="N required") +
+  theme_minimal(base_size=12)
+```
+
+------------------------------------------------------------------------
+
+# 2) PASS/FAIL analysis on current data
+
+```{r}
+real_dat    <- c(rep(C,46), 1.6e-8, 2.0e-8, 3.8e-8, 7.0e-8)
+real_censor <- c(rep(1,46), rep(0,4))
+
+# load necessary libraries and scripts
+library(rstan)
+library(evd)
+source("exp_mcmc.R")
+set.seed(1234)
+
+```
+
+## 2.1 Exponential
+
+```{r}
+# Set key parameters and hyperpriors
+threshold <- 1 * 10^-7
+epsilon = 3e-6
+hyper1 <- 2
+hyper2 <- threshold/(epsilon^(-1/hyper1)-1)
+
+# sample from posterior using exponential distribution
+draws <- fit_censored_exponential_model(hyper1,hyper2,real_dat,real_censor)
+
+# calculate DIC using exponential 
+dev_mean <- -2*exp_log_likelihood(mean(draws),real_dat,real_censor)
+mean_dev <- -2*mean(sapply(draws,function(x)exp_log_likelihood(x,real_dat,real_censor)))
+DIC_exp <- dev_mean + 2*mean_dev                
+DIC_exp
+```
+
+```{r}
+ggplot(data.frame(lambda=draws), aes(lambda)) +
+  geom_histogram(bins=60) + theme_minimal() +
+  labs(title="Posterior density (Exponential λ)")
+```
+
+## 2.2 GPD
+
+```{r}
+# set key parameters and hyperparameters for GPD
+cens_id <- which(real_censor == 1)
+notcens_id <- which(real_censor == 0)
+hyper1 <- .1
+hyper2 <- hyper1 * 1e-6 / ((3e-6)^(-sqrt(pi/2) * hyper1) - 1)
+
+# sample from posterior using GPD
+my_data <- list(
+  n = 50,
+  helium = real_dat,
+  n_cens = length(cens_id),
+  n_not_cens = length(notcens_id),
+  cens_id = as.array(cens_id),
+  nocens_id = as.array(notcens_id),
+  b = hyper1,
+  a = hyper2
+)
+
+fit <- stan(
+  file = "gpd.stan",
+  data = my_data,
+  chains = 1,
+  warmup = 5000,
+  iter = 20000,
+  refresh = 0  # To avoid excessive logging
+)
+post <- extract(fit)
+
+# Calulate DIC using GPD
+dev_mean <- -2*gpd_log_likelihood(c(mean(post$sigma),mean(post$k)),real_dat,real_censor)
+mean_dev <- -2*mean(sapply(1:length(post$k),function(x)gpd_log_likelihood(c(post$sigma[x],post$k[x]),real_dat,real_censor)))
+DIC_gpd <- dev_mean + 2*mean_dev                
+DIC_gpd
+```
+
+```{r}
+post_gpd <- data.frame(sigma = post$sigma,xi = post$k)
+ggplot(post_gpd, aes(xi)) + geom_histogram(bins=60) +
+  theme_minimal() + labs(title="Posterior density (GPD ξ)")
+```
+
+------------------------------------------------------------------------
+
+# 3) Summary table
+
+```{r}
+# print results
+print(paste("The DIC using the exponential distribution is ",round(DIC_exp,2)))
+print(paste("The DIC using the GPD distribution is ",round(DIC_gpd,2)))
+            
+
+```
